@@ -57,39 +57,69 @@ def _get_clob_client():
 
 async def get_active_markets(market_slug: str) -> List[Dict[str, Any]]:
     """
-    Fetch active BTC 5-minute windows matching *market_slug*.
+    Fetch active BTC 5-minute windows from the Polymarket gamma API.
 
-    Returns a list of market dicts, each with at minimum:
-      - token_id (condition_id)
-      - question
-      - end_date_iso
-      - outcomes  [{name, token_id, price}]
+    Uses the events endpoint with slug format: btc-updown-5m-{unix_timestamp}
+    where the timestamp is rounded to the nearest upcoming 5-minute window.
+
+    Returns a list of market dicts from the event.
     """
-    url = f"{settings.POLYMARKET_CLOB_API_URL}/markets"
-    params: Dict[str, Any] = {"closed": False, "limit": 20}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+    import time
+    import math
 
-        # The CLOB API returns a list directly or a wrapper object
-        markets_raw: List[Dict[str, Any]] = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+    now = time.time()
+    window_seconds = 300  # 5 minutes
 
-        # Filter to the ones whose question / slug contain our target slug
-        slug_lower = market_slug.lower()
-        matched: List[Dict[str, Any]] = []
-        for mkt in markets_raw:
-            question = (mkt.get("question") or "").lower()
-            condition_id = mkt.get("condition_id", "")
-            if slug_lower in question or slug_lower in condition_id.lower():
-                matched.append(mkt)
+    # Compute the current and next few 5-min window timestamps
+    current_window = int(math.floor(now / window_seconds) * window_seconds)
+    timestamps_to_try = [
+        current_window + window_seconds,      # next window
+        current_window + 2 * window_seconds,   # window after next
+        current_window,                        # current window (might still be active)
+    ]
 
-        logger.info("Found %d active markets matching '%s'", len(matched), market_slug)
-        return matched
-    except Exception as exc:
-        logger.error("get_active_markets error: %s", exc)
-        return []
+    base_url = settings.POLYMARKET_CLOB_API_URL.rstrip("/")
+
+    for ts in timestamps_to_try:
+        slug = f"{market_slug}-{ts}"
+        url = f"{base_url}/events"
+        params = {"slug": slug}
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+
+            # The gamma events API returns a list of events
+            events: List[Dict[str, Any]] = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+
+            if not events:
+                continue
+
+            # Each event contains a "markets" array — extract them
+            all_markets: List[Dict[str, Any]] = []
+            for event in events:
+                event_markets = event.get("markets", [])
+                if isinstance(event_markets, list):
+                    all_markets.extend(event_markets)
+                # Also include the event itself if it has a condition_id
+                if event.get("condition_id") and not event_markets:
+                    all_markets.append(event)
+
+            if all_markets:
+                logger.info(
+                    "Found %d markets for slug '%s' (ts=%d)",
+                    len(all_markets), slug, ts,
+                )
+                return all_markets
+
+        except Exception as exc:
+            logger.warning("get_active_markets error for slug '%s': %s", slug, exc)
+            continue
+
+    logger.info("No active markets found for '%s' across %d windows", market_slug, len(timestamps_to_try))
+    return []
 
 
 async def get_orderbook(token_id: str) -> Dict[str, Any]:

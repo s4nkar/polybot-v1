@@ -19,7 +19,7 @@ class Settings:
     POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
     POLYMARKET_WALLET_ADDRESS: str = os.getenv("POLYMARKET_WALLET_ADDRESS", "")
     POLYMARKET_PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-    POLYMARKET_CLOB_API_URL: str = os.getenv("POLYMARKET_CLOB_API_URL", "https://gamma-api.polymarket.com/markets?slug=btc-updown-5m-{timestamp}")
+    POLYMARKET_CLOB_API_URL: str = os.getenv("POLYMARKET_CLOB_API_URL", "https://gamma-api.polymarket.com")
     POLYMARKET_CHAIN_ID: int = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
 
     # ── Binance ───────────────────────────────────────────
