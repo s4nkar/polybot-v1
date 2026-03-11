@@ -18,6 +18,7 @@ Full execution loop (PRD section 4.2):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -62,6 +63,7 @@ async def run_bot1(
             if status_update:
                 status_update(f"Round {round_num}: Scanning for active markets…", round_num)
             markets = await polymarket.get_active_markets(params.market_slug)
+            logger.info("get_active_markets returned %d markets", len(markets))
             if not markets:
                 logger.info("No active markets found — waiting 10 s")
                 if status_update:
@@ -89,22 +91,62 @@ async def run_bot1(
                 up_token_id = market_id
                 down_token_id = market_id
 
+            # ── Parse outcomePrices from market data ───────────
+            up_price = 0.0
+            down_price = 0.0
+            try:
+                raw_prices = market.get("outcomePrices", "[]")
+                if isinstance(raw_prices, str):
+                    parsed_prices = json.loads(raw_prices)
+                else:
+                    parsed_prices = raw_prices
+                if len(parsed_prices) >= 2:
+                    up_price = float(parsed_prices[0])
+                    down_price = float(parsed_prices[1])
+            except Exception as exc:
+                logger.warning("Failed to parse outcomePrices: %s", exc)
+
+            # Check if market is already resolved
+            if (up_price in (0.0, 1.0) and down_price in (0.0, 1.0)):
+                reason = f"Market already resolved (UP={up_price}, DOWN={down_price})"
+                logger.info("Bot1 skip: %s", reason)
+                if status_update:
+                    status_update(f"Round {round_num}: Skipped — {reason}", round_num)
+                await telegram.trade_skipped(bot_id, reason)
+                await asyncio.sleep(5)
+                continue
+
+            logger.info(
+                "outcomePrices — UP=%.4f  DOWN=%.4f",
+                up_price, down_price,
+            )
+
+            # ── Read pre-computed timing from market dict ──────
+            seconds_remaining = market.get("seconds_remaining", 300.0)
+            elapsed = market.get("elapsed", 0.0)
+            end_date_str = market.get("endDate", "")
+
+            if elapsed < 30 or elapsed > 270:
+                reason = f"Outside entry window (elapsed={elapsed:.0f}s, need 30–270s)"
+                logger.info("Bot1 skip: %s", reason)
+                if status_update:
+                    status_update(f"Round {round_num}: Skipped — {reason}", round_num)
+                await telegram.trade_skipped(bot_id, reason)
+                await asyncio.sleep(5)
+                continue
+
+            logger.info(
+                "Timing — elapsed=%.0fs  remaining=%.0fs  window=%.0fs",
+                elapsed, seconds_remaining,
+                market.get("window_duration", 300.0),
+            )
+
             # ── Step 2: Fetch BTC data from Binance ───────────
             btc_price = await binance.get_btc_price()
             klines = await binance.get_klines(interval="1m", limit=5)
 
             # ── Step 3: Get orderbook + compute signal score ──
             order_book = await polymarket.get_orderbook(up_token_id or market_id)
-
-            # Approximate seconds remaining (default 300 for a 5-min window)
-            end_date_str = market.get("end_date_iso", "")
-            seconds_remaining = 300.0
-            if end_date_str:
-                try:
-                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                    seconds_remaining = max((end_dt - datetime.now(timezone.utc)).total_seconds(), 0)
-                except Exception:
-                    pass
 
             market_data = {
                 "best_bid": order_book["best_bid"],
@@ -128,14 +170,44 @@ async def run_bot1(
                 await asyncio.sleep(5)
                 continue
 
-            # Decide side: buy UP if recent candles are bullish, else DOWN
-            bullish = sum(1 for c in klines if c["close"] > c["open"])
-            side = "UP" if bullish >= len(klines) / 2 else "DOWN"
-            token_to_buy = up_token_id if side == "UP" else down_token_id
-            entry_price = order_book["best_ask"]
+            # ── Pick the cheaper side (better value) ──────────
+            # Cheaper side = crowd thinks less likely = more upside
+            valid_up = 0.01 <= up_price <= 0.99
+            valid_down = 0.01 <= down_price <= 0.99
 
-            if entry_price <= 0 or entry_price >= 1:
-                await telegram.trade_skipped(bot_id, f"Invalid entry price {entry_price}")
+            # If one side is > 0.85, prefer the other
+            if valid_up and up_price > 0.85 and valid_down:
+                side = "DOWN"
+            elif valid_down and down_price > 0.85 and valid_up:
+                side = "UP"
+            elif valid_up and valid_down:
+                side = "UP" if up_price < down_price else "DOWN"
+            elif valid_up:
+                side = "UP"
+            elif valid_down:
+                side = "DOWN"
+            else:
+                reason = f"No valid entry price (UP={up_price:.4f}, DOWN={down_price:.4f})"
+                logger.info("Bot1 skip: %s", reason)
+                if status_update:
+                    status_update(f"Round {round_num}: Skipped — {reason}", round_num)
+                await telegram.trade_skipped(bot_id, reason)
+                await asyncio.sleep(5)
+                continue
+
+            token_to_buy = up_token_id if side == "UP" else down_token_id
+            entry_price = up_price if side == "UP" else down_price
+
+            logger.info(
+                "Chose side=%s  entry_price=%.4f  (UP=%.4f DOWN=%.4f)",
+                side, entry_price, up_price, down_price,
+            )
+
+            if entry_price < 0.01 or entry_price > 0.99:
+                reason = f"Invalid entry price {entry_price:.4f}"
+                await telegram.trade_skipped(bot_id, reason)
+                if status_update:
+                    status_update(f"Round {round_num}: Skipped — {reason}", round_num)
                 await asyncio.sleep(5)
                 continue
 
@@ -210,12 +282,16 @@ async def run_bot1(
                 # Recalculate seconds remaining
                 if end_date_str:
                     try:
-                        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                        end_dt = datetime.fromisoformat(
+                            end_date_str.replace("Z", "+00:00")
+                        )
                         seconds_remaining = max(
                             (end_dt - datetime.now(timezone.utc)).total_seconds(), 0
                         )
                     except Exception:
                         seconds_remaining -= 3
+                else:
+                    seconds_remaining -= 3
 
                 # Win — take profit
                 if current_price >= target_price:

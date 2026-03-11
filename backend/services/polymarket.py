@@ -72,13 +72,14 @@ async def get_active_markets(market_slug: str) -> List[Dict[str, Any]]:
 
     # Compute the current and next few 5-min window timestamps
     current_window = int(math.floor(now / window_seconds) * window_seconds)
+
     timestamps_to_try = [
-        current_window + window_seconds,      # next window
-        current_window + 2 * window_seconds,   # window after next
-        current_window,                        # current window (might still be active)
+    current_window,                         # current window — try first
+    current_window - window_seconds,        # just-ended window (edge case)
+    current_window + window_seconds,        # upcoming window
     ]
 
-    base_url = settings.POLYMARKET_CLOB_API_URL.rstrip("/")
+    base_url = settings.POLYMARKET_GAMMA_API_URL.rstrip("/")
 
     for ts in timestamps_to_try:
         slug = f"{market_slug}-{ts}"
@@ -98,21 +99,97 @@ async def get_active_markets(market_slug: str) -> List[Dict[str, Any]]:
                 continue
 
             # Each event contains a "markets" array — extract them
+            # Also propagate event-level timing fields to market objects
             all_markets: List[Dict[str, Any]] = []
             for event in events:
+                event_end = event.get("endDate", "")
+                event_start = event.get("startTime", "")
+
                 event_markets = event.get("markets", [])
                 if isinstance(event_markets, list):
+                    for em in event_markets:
+                        # Market-level fields take priority; fall back
+                        # to event-level if missing
+                        if not em.get("endDate"):
+                            em["endDate"] = event_end
+                        if not em.get("eventStartTime") and not em.get("startTime"):
+                            em["eventStartTime"] = event_start
                     all_markets.extend(event_markets)
                 # Also include the event itself if it has a condition_id
                 if event.get("condition_id") and not event_markets:
                     all_markets.append(event)
 
-            if all_markets:
-                logger.info(
-                    "Found %d markets for slug '%s' (ts=%d)",
-                    len(all_markets), slug, ts,
+            # ── Filter markets by state and timing window ──
+            from datetime import datetime, timezone
+
+            valid_markets: List[Dict[str, Any]] = []
+            for mkt in all_markets:
+                # Must be accepting orders, active, and not closed
+                if not mkt.get("acceptingOrders", False):
+                    logger.debug("Skipping market — acceptingOrders is False")
+                    continue
+                if not mkt.get("active", False):
+                    logger.debug("Skipping market — active is False")
+                    continue
+                if mkt.get("closed", True):
+                    logger.debug("Skipping market — market is closed")
+                    continue
+
+                # ── Compute timing from full ISO datetime fields ──
+                end_str = mkt.get("endDate", "")
+                start_str = (
+                    mkt.get("eventStartTime", "")
+                    or mkt.get("startTime", "")
                 )
-                return all_markets
+
+                if not end_str:
+                    logger.debug("Skipping market — no endDate field")
+                    continue
+
+                try:
+                    now = datetime.now(timezone.utc)
+                    end_dt = datetime.fromisoformat(
+                        end_str.replace("Z", "+00:00")
+                    )
+
+                    secs_rem = max((end_dt - now).total_seconds(), 0)
+
+                    if start_str:
+                        start_dt = datetime.fromisoformat(
+                            start_str.replace("Z", "+00:00")
+                        )
+                        elapsed = max((now - start_dt).total_seconds(), 0)
+                        window_dur = (end_dt - start_dt).total_seconds()
+                    else:
+                        # Fallback: assume 300s window
+                        window_dur = 300.0
+                        elapsed = max(window_dur - secs_rem, 0)
+
+                    # # Only accept markets mid-window (elapsed 60–270s)
+                    # if elapsed < 60 or elapsed > 270:
+                    #     logger.debug(
+                    #         "Skipping market — elapsed=%.0f outside [60, 270]",
+                    #         elapsed,
+                    #     )
+                    #     continue
+
+                    # Attach computed timing so bot doesn't recalculate
+                    mkt["seconds_remaining"] = secs_rem
+                    mkt["elapsed"] = elapsed
+                    mkt["window_duration"] = window_dur
+
+                except Exception as exc:
+                    logger.debug("Could not parse timing for market: %s", exc)
+                    continue  # skip unparseable markets
+
+                valid_markets.append(mkt)
+
+            if valid_markets:
+                logger.info(
+                    "Found %d valid markets (of %d total) for slug '%s' (ts=%d)",
+                    len(valid_markets), len(all_markets), slug, ts,
+                )
+                return valid_markets
 
         except Exception as exc:
             logger.warning("get_active_markets error for slug '%s': %s", slug, exc)
