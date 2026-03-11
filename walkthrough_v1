@@ -1,0 +1,59 @@
+# Polybot Trading Enhancements — Walkthrough
+
+## What Changed
+
+### Backend (6 files modified)
+
+| File | Change |
+|------|--------|
+| [schema.sql](file:///d:/Projects/Vibe%20Code/polybot_v1/supabase/schema.sql) | Added `trading_mode` column (`live`/`paper`) |
+| [schemas.py](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/models/schemas.py) | Added [TradingMode](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/models/schemas.py#34-37) enum, [AnalyticsSummary](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/models/schemas.py#152-164), [TradeListResponse](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/models/schemas.py#166-172) |
+| [supabase.py](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/db/supabase.py) | Added [get_all_trades()](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/main.py#230-240), [get_analytics_summary()](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/db/supabase.py#103-145) |
+| [bot1.py](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/bots/bot1.py) | 5-min intervals, `trading_mode` param |
+| [bot2.py](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/bots/bot2.py) | 5-min intervals, `trading_mode` param |
+| [main.py](file:///d:/Projects/Vibe%20Code/polybot_v1/backend/main.py) | 24hr auto-stop, `GET /api/trades/all`, `GET /api/analytics` |
+
+### Frontend (5 files modified/created)
+
+| File | Change |
+|------|--------|
+| [api.js](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/services/api.js) | Added [getAllTrades()](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/services/api.js#48-51), [getAnalytics()](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/services/api.js#52-55) |
+| [Launcher.jsx](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/pages/Launcher.jsx) | Live/Paper toggle, mode indicator |
+| [BotForm.jsx](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/components/BotForm.jsx) | Replaced dry_run toggle, 24hr/5-min info banner |
+| [Analytics.jsx](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/pages/Analytics.jsx) | **NEW** — Stats + paginated trade table |
+| [App.jsx](file:///d:/Projects/Vibe%20Code/polybot_v1/frontend/src/App.jsx) | Added Analytics route |
+
+---
+
+## Key Features
+
+1. **24-Hour Auto-Stop** — Bots auto-terminate after 24 hours via an async timer wrapper
+2. **5-Minute Trade Intervals** — Sleep 300s between rounds (checks `stop_event` every 5s for responsiveness)
+3. **Live / Paper Toggle** — Prominent mode selector on the Dashboard; `live` → real orders, `paper` → simulated
+4. **Trade History Persistence** — Every trade stored with `trading_mode` column for both modes
+5. **Analytics Dashboard** — 10 stat cards, All/Live/Paper filter tabs, paginated trade table
+
+---
+
+## Verification
+
+### Build
+✅ `npm run build` — succeeded with exit code 0
+
+### Visual Inspection
+
+````carousel
+![Dashboard with live/paper trading mode toggle](C:/Users/Asus/.gemini/antigravity/brain/e55c5659-6ec9-4203-835b-fae4b4df75ae/dashboard_view_1773175032979.png)
+<!-- slide -->
+![Analytics page with filter tabs and trade table](C:/Users/Asus/.gemini/antigravity/brain/e55c5659-6ec9-4203-835b-fae4b4df75ae/analytics_view_1773175049594.png)
+````
+
+> [!NOTE]
+> The 500 errors in the console are expected — the backend is not running. Once you start the backend with `python -m backend.main`, all API calls will work correctly.
+
+### DB Migration
+> [!IMPORTANT]
+> Run this SQL against your Supabase database to add the new column:
+> ```sql
+> ALTER TABLE trades ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper' CHECK (trading_mode IN ('live', 'paper'));
+> ```

@@ -1,0 +1,30 @@
+# Virtual Environment
+/venv
+
+# Model and Large File Directories
+/models/bert
+/models/lr
+/models/rf
+/models/roberta
+/lr
+/rf
+/roberta
+/client____
+
+# Python Cache & Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.zip
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Logs and Temporary Files
+*.log
+.DS_Store
+*.swp
+*.swo
+
+.env
