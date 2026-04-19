@@ -75,3 +75,31 @@ CREATE TRIGGER set_global_config_updated_at
 INSERT INTO global_config (telegram_enabled, default_dry_run, default_amount_usd, environment)
 VALUES (TRUE, TRUE, 5.0, 'dev')
 ON CONFLICT DO NOTHING;
+
+
+-- ============================================================
+-- Fix Polybot trades table — add missing columns from Bot1
+-- ============================================================
+-- Run this in Supabase SQL Editor to add columns that bot1.py needs
+
+-- 1. Add columns if they don't exist (for Bot1 specifically)
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_id TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS token_id TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS target_price NUMERIC(10, 4);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_price NUMERIC(10, 4);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS take_profit_cents NUMERIC(6, 4);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss_cents NUMERIC(6, 4);
+
+-- 2. Verify all required columns exist
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_name = 'trades'
+ORDER BY ordinal_position;
+
+-- 3. (Optional) Add comments to document new columns
+COMMENT ON COLUMN trades.order_id IS 'Order ID from place_order() or dry-run-simulated';
+COMMENT ON COLUMN trades.token_id IS 'Polymarket token ID for this trade (UP or DOWN side)';
+COMMENT ON COLUMN trades.target_price IS 'Take-profit exit level (entry_price + take_profit_cents/100)';
+COMMENT ON COLUMN trades.stop_price IS 'Stop-loss exit level (entry_price - stop_loss_cents/100)';
+COMMENT ON COLUMN trades.take_profit_cents IS 'TP in cents (e.g. 0.11 = 11 cents above entry)';
+COMMENT ON COLUMN trades.stop_loss_cents IS 'SL in cents (e.g. 0.25 = 25 cents below entry)';

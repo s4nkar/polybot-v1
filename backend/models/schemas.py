@@ -39,15 +39,15 @@ class TradingMode(str, Enum):
 # ── Bot parameter models ─────────────────────────────────
 
 class Bot1Params(BaseModel):
-    """Parameters for Bot 1 — Scalp to Target."""
-    market_slug: str = Field(..., description="Polymarket market slug for BTC 5-min windows")
+    """Parameters for Bot 1 — WebSocket Scalper (28–30 cent entry)."""
+    market_slug: str = Field("btc-updown-5m", description="Polymarket market slug for BTC 5-min windows")
     amount_usd: float = Field(5.0, gt=0, description="Stake per trade in USD")
-    use_score_threshold: bool = Field(True, description="Enable/disable score threshold filter")
-    score_threshold: float = Field(0.6, ge=0.0, le=1.0, description="Minimum signal score to enter")
-    target_profit_pct: float = Field(20.0, gt=0, description="Take-profit target as % of entry")
-    stop_loss_pct: float = Field(50.0, gt=0, description="Stop-loss trigger as % of entry")
-    time_stop_seconds: int = Field(45, gt=0, description="Force-exit if seconds remaining < this value")
-    max_rounds: Optional[int] = Field(None, ge=1, description="Stop after N rounds (None = unlimited)")
+    entry_min: float = Field(0.28, ge=0.01, le=0.99, description="Lower bound of entry zone (token ask price)")
+    entry_max: float = Field(0.30, ge=0.01, le=0.99, description="Upper bound of entry zone (token ask price)")
+    take_profit_cents: float = Field(0.11, gt=0, description="Cents above entry price to take profit (e.g. 0.11 = exit at entry + 0.11)")
+    stop_loss_cents: float = Field(0.05, gt=0, description="Cents below entry price to cut loss (e.g. 0.05 = exit at entry − 0.05)")
+    time_stop_seconds: int = Field(45, gt=0, description="Force-exit SELL when seconds remaining < this value")
+    max_rounds: Optional[int] = Field(None, ge=1, description="Stop after N completed trades (None = unlimited)")
 
 
 class Bot2Params(BaseModel):

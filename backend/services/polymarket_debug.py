@@ -1,24 +1,9 @@
 """
-Polybot — Polymarket service.
+Polybot — Polymarket service (DEBUG VERSION).
 
-Responsibilities:
-  - Market discovery via Gamma REST API
-  - Orderbook snapshots via CLOB REST API
-  - Live price streaming via CLOB WebSocket
-  - Order placement via py-clob-client SDK
-  - Post-resolution outcome fetching
-
-WebSocket endpoint:
-  wss://ws-subscriptions-clob.polymarket.com/ws/market
-
-  Subscribe message (send immediately after connect):
-    {"assets_ids": ["<token_id>"], "type": "market"}
-
-  Incoming message types handled:
-    "book"         — full orderbook snapshot (bids + asks arrays)
-    "price_change" — lightweight last-trade tick (price field)
-
-All previous bug-fixes (B1–B6) are retained.
+This version adds detailed logging to diagnose WebSocket message flow.
+Replace your original polymarket.py with this to see exactly what messages
+are being received and why on_price() may not be firing.
 """
 
 from __future__ import annotations
@@ -35,8 +20,8 @@ import httpx
 
 from config import settings
 
-# logger = logging.getLogger(__name__)
-logger = logging.getLogger("services.polymarket").setLevel(logging.DEBUG)
+logger = logging.getLogger("services.polymarket")
+logger.setLevel(logging.DEBUG)
 
 # ── Lazy imports for live trading ─────────────────────────────────────────────
 
@@ -295,6 +280,8 @@ async def stream_orderbook(
     """
     Stream live orderbook updates via Polymarket CLOB WebSocket.
 
+    DEBUG VERSION: Logs all message activity to diagnose silent streams.
+
     Confirmed message format (from live testing):
       {"market":"0x...","price_changes":[{"asset_id":"...","price":"0.52"}]}
     No event_type field — detected by presence of price_changes key.
@@ -314,6 +301,9 @@ async def stream_orderbook(
     })
 
     logger.info("WS stream starting — token_id=%s", token_id)
+    logger.info("WS subscribe message: %s", subscribe_msg)
+
+    tick_count = 0
 
     while not stop_event.is_set():
         try:
@@ -325,61 +315,84 @@ async def stream_orderbook(
                 open_timeout=10,
             ) as ws:
                 await ws.send(subscribe_msg)
-                logger.warning(f"✓ SUBSCRIBED to token {token_id[:20]}...")
+                logger.info("✓ WS subscribed — token_id=%s", token_id)
 
                 async def _heartbeat():
                     while not stop_event.is_set():
                         await asyncio.sleep(10)
                         try:
                             await ws.send("PING")
-                            logger.debug("WS PING — token=%s", token_id[:8])
+                            logger.debug("→ WS PING sent — token=%s", token_id[:16])
                         except Exception:
                             break
 
                 heartbeat_task = asyncio.create_task(_heartbeat())
 
                 try:
-                    tick_count = 0
                     async for raw in ws:
                         if stop_event.is_set():
                             break
-                        tick_count += 1
 
-                        # logger.warning(f"🔴 WS TICK #{tick_count} token={token_id[:20]}... raw={str(raw)[:200]}")
+                        tick_count += 1
+                        logger.info("[WS TICK #%d] raw=%s", tick_count, str(raw)[:200])
 
                         # Server echoes "PONG" for our "PING" — skip it
                         if raw == "PONG":
+                            logger.debug("← WS PONG received")
                             continue
 
                         try:
                             msg = json.loads(raw)
-                        except (json.JSONDecodeError, TypeError):
+                            logger.info("[WS PARSED #%d] msg_type=%s keys=%s", 
+                                tick_count,
+                                type(msg).__name__,
+                                list(msg.keys()) if isinstance(msg, dict) else "list"
+                            )
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logger.warning("[WS ERROR #%d] JSON parse failed: %s", tick_count, e)
                             continue
 
                         events = msg if isinstance(msg, list) else [msg]
+                        logger.info("[WS EVENTS #%d] count=%d", tick_count, len(events))
 
-                        for event in events:
+                        for idx, event in enumerate(events):
+                            logger.info("[WS EVENT %d.%d] keys=%s", tick_count, idx, list(event.keys()) if isinstance(event, dict) else "N/A")
+
                             # ── price_change ─────────────────────────────────
-                            # Real format: {"market":"0x...","price_changes":[
-                            #   {"asset_id":"<token_id>","price":"0.52"}
-                            # ]}
-                            # No event_type field — detect by key presence.
                             price_changes = event.get("price_changes")
                             if price_changes:
-                                for change in price_changes:
+                                logger.info("[WS PRICE_CHANGE %d.%d] changes=%s", tick_count, idx, price_changes)
+                                for chg_idx, change in enumerate(price_changes):
                                     try:
+                                        asset_id = change.get("asset_id", "")
                                         price_str = change.get("price", "")
+                                        logger.info("[WS CHANGE %d.%d.%d] asset=%s price_str=%s", 
+                                            tick_count, idx, chg_idx, asset_id[:32], price_str)
+                                        
                                         if not price_str:
+                                            logger.warning("[WS CHANGE SKIP %d.%d.%d] empty price", tick_count, idx, chg_idx)
                                             continue
+                                        
                                         price = float(price_str)
                                         if price <= 0.0:
+                                            logger.warning("[WS CHANGE SKIP %d.%d.%d] price <= 0: %f", tick_count, idx, chg_idx, price)
                                             continue
-                                        # Fire only when this change belongs
-                                        # to our subscribed token_id
-                                        if change.get("asset_id") == token_id:
+                                        
+                                        asset_match = (asset_id == token_id)
+                                        logger.info("[WS ASSET_CHECK %d.%d.%d] our_token=%s target=%s match=%s", 
+                                            tick_count, idx, chg_idx, 
+                                            token_id[:32], 
+                                            asset_id[:32], 
+                                            asset_match
+                                        )
+                                        
+                                        if asset_match:
+                                            logger.info("✓ [WS FIRE #%d] on_price(%f, %f)", tick_count, price, price)
                                             on_price(price, price)
-                                    except (ValueError, TypeError):
-                                        pass
+                                        else:
+                                            logger.warning("✗ [WS SKIP #%d] asset mismatch", tick_count)
+                                    except (ValueError, TypeError) as e:
+                                        logger.warning("[WS CHANGE ERROR %d.%d.%d] %s", tick_count, idx, chg_idx, e)
                                 continue
 
                             # ── book snapshot ─────────────────────────────────
@@ -389,20 +402,26 @@ async def stream_orderbook(
                                 asks = event.get("asks", [])
                                 best_bid = float(bids[-1]["price"]) if bids else 0.0
                                 best_ask = float(asks[0]["price"])  if asks else 0.0
+                                logger.info("[WS BOOK #%d] bid=%f ask=%f", tick_count, best_bid, best_ask)
                                 if best_bid > 0.0 or best_ask > 0.0:
+                                    logger.info("✓ [WS FIRE #%d from book] on_price(%f, %f)", tick_count, best_bid, best_ask)
                                     on_price(best_bid, best_ask)
 
                             elif etype == "last_trade_price":
                                 try:
                                     price = float(event.get("price") or 0)
+                                    logger.info("[WS TRADE_PRICE #%d] price=%f", tick_count, price)
                                     if price > 0.0:
+                                        logger.info("✓ [WS FIRE #%d from trade] on_price(%f, %f)", tick_count, price, price)
                                         on_price(price, price)
-                                except (ValueError, TypeError):
-                                    pass
+                                except (ValueError, TypeError) as e:
+                                    logger.warning("[WS TRADE_PRICE ERROR #%d] %s", tick_count, e)
+                            
+                            if not any([price_changes, etype in ("book", "last_trade_price")]):
+                                logger.debug("[WS UNHANDLED %d.%d] event_type=%s no handler", tick_count, idx, etype)
 
                 finally:
                     heartbeat_task.cancel()
-                    # logger.warning(f"🔴 WS TICK STOPPED for token {token_id}")
                     try:
                         await heartbeat_task
                     except asyncio.CancelledError:
@@ -421,7 +440,9 @@ async def stream_orderbook(
             )
             await asyncio.sleep(reconnect_delay)
 
-    logger.info("WS stream stopped — token_id=%s", token_id)
+    logger.info("WS stream stopped — token_id=%s (received %d ticks)", token_id, tick_count)
+
+
 # ── Order placement ───────────────────────────────────────────────────────────
 
 
@@ -519,24 +540,3 @@ async def get_market_outcome(market_id: str, side: str) -> float:
     except Exception as exc:
         logger.error("get_market_outcome error: %s", exc)
         return 0.5
-
-
-# if __name__ == "__main__":
-#     import sys
-#     # Must configure logging BEFORE anything else runs
-#     logging.basicConfig(
-#         level=logging.DEBUG,
-#         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-#     )
-#     # Re-create the logger now that logging is configured
-#     logger = logging.getLogger(__name__)
-
-#     token_id = sys.argv[1] if len(sys.argv) > 1 else \
-#         "58569780351927609770409071492560642676500885849834275244155093807620690046332"
-
-#     stop = asyncio.Event()
-
-#     def on_price(bid, ask):
-#         print(f">>> TICK bid={bid:.4f} ask={ask:.4f}")
-
-#     asyncio.run(stream_orderbook(token_id, on_price, stop))

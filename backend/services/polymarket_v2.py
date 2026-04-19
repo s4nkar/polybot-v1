@@ -1,5 +1,5 @@
 """
-Polybot — Polymarket service.
+Polybot — Polymarket service (FIXED VERSION).
 
 Responsibilities:
   - Market discovery via Gamma REST API
@@ -18,7 +18,7 @@ WebSocket endpoint:
     "book"         — full orderbook snapshot (bids + asks arrays)
     "price_change" — lightweight last-trade tick (price field)
 
-All previous bug-fixes (B1–B6) are retained.
+FIXED: Prioritize book snapshots with real bid/ask over lightweight ticks
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ import httpx
 
 from config import settings
 
-# logger = logging.getLogger(__name__)
-logger = logging.getLogger("services.polymarket").setLevel(logging.DEBUG)
+logger = logging.getLogger("services.polymarket")
+logger.setLevel(logging.DEBUG)
 
 # ── Lazy imports for live trading ─────────────────────────────────────────────
 
@@ -295,9 +295,18 @@ async def stream_orderbook(
     """
     Stream live orderbook updates via Polymarket CLOB WebSocket.
 
-    Confirmed message format (from live testing):
-      {"market":"0x...","price_changes":[{"asset_id":"...","price":"0.52"}]}
-    No event_type field — detected by presence of price_changes key.
+    FIXED: Prioritizes book snapshots with real bid/ask over lightweight ticks.
+    
+    Message types received:
+      1. Book snapshot: {"bids": [...], "asks": [...], ...}
+         → Extract best_bid/best_ask for accurate entry/exit
+      
+      2. Price changes: {"price_changes": [{"asset_id": "...", "price": "0.52"}]}
+         → Lightweight ticks, use as fallback
+      
+      3. Last trade: {"event_type": "last_trade_price", "price": "0.52"}
+         → Single trade, use as fallback
+    
     Requires raw text "PING" every 10s to keep stream alive.
     """
     try:
@@ -325,6 +334,7 @@ async def stream_orderbook(
                 open_timeout=10,
             ) as ws:
                 await ws.send(subscribe_msg)
+                logger.info("WS subscribed — token_id=%s", token_id)
                 logger.warning(f"✓ SUBSCRIBED to token {token_id[:20]}...")
 
                 async def _heartbeat():
@@ -359,50 +369,59 @@ async def stream_orderbook(
                         events = msg if isinstance(msg, list) else [msg]
 
                         for event in events:
-                            # ── price_change ─────────────────────────────────
-                            # Real format: {"market":"0x...","price_changes":[
-                            #   {"asset_id":"<token_id>","price":"0.52"}
-                            # ]}
-                            # No event_type field — detect by key presence.
+                            # ── BOOK SNAPSHOT (highest priority) ────────────────
+                            # Has real bid/ask prices, best for entry/exit decisions
+                            if "bids" in event and "asks" in event:
+                                bids = event.get("bids", [])
+                                asks = event.get("asks", [])
+                                try:
+                                    best_bid = float(bids[-1]["price"]) if bids else 0.0
+                                    best_ask = float(asks[0]["price"]) if asks else 0.0
+                                    if best_bid > 0.0 or best_ask > 0.0:
+                                        logger.warning(f"📊 BOOK SNAPSHOT: bid={best_bid:.4f} ask={best_ask:.4f}")
+                                        on_price(best_bid, best_ask)
+                                except (ValueError, TypeError, KeyError) as e:
+                                    logger.debug(f"Book snapshot parse error: {e}")
+                                continue
+
+                            # ── PRICE CHANGES (lightweight ticks) ──────────────
+                            # Format: {"price_changes": [{"asset_id": "...", "price": "0.52"}]}
                             price_changes = event.get("price_changes")
                             if price_changes:
                                 for change in price_changes:
                                     try:
+                                        asset_id = change.get("asset_id", "")
                                         price_str = change.get("price", "")
+                                        
                                         if not price_str:
                                             continue
+                                        
                                         price = float(price_str)
                                         if price <= 0.0:
                                             continue
-                                        # Fire only when this change belongs
-                                        # to our subscribed token_id
-                                        if change.get("asset_id") == token_id:
+                                        
+                                        # Fire only when this change belongs to our subscribed token_id
+                                        if asset_id == token_id:
+                                            # logger.info(f"💰 PRICE CHANGE: price={price:.4f} asset={asset_id[:20]}...")
                                             on_price(price, price)
-                                    except (ValueError, TypeError):
-                                        pass
+                                    except (ValueError, TypeError) as e:
+                                        logger.debug(f"Price change parse error: {e}")
                                 continue
 
-                            # ── book snapshot ─────────────────────────────────
+                            # ── LAST TRADE PRICE ──────────────────────────────
                             etype = event.get("event_type", event.get("type", ""))
-                            if etype == "book":
-                                bids = event.get("bids", [])
-                                asks = event.get("asks", [])
-                                best_bid = float(bids[-1]["price"]) if bids else 0.0
-                                best_ask = float(asks[0]["price"])  if asks else 0.0
-                                if best_bid > 0.0 or best_ask > 0.0:
-                                    on_price(best_bid, best_ask)
-
-                            elif etype == "last_trade_price":
+                            if etype == "last_trade_price":
                                 try:
                                     price = float(event.get("price") or 0)
                                     if price > 0.0:
+                                        logger.info(f"🔄 LAST TRADE PRICE: {price:.4f}")
                                         on_price(price, price)
-                                except (ValueError, TypeError):
-                                    pass
+                                except (ValueError, TypeError) as e:
+                                    logger.debug(f"Last trade price parse error: {e}")
 
                 finally:
                     heartbeat_task.cancel()
-                    # logger.warning(f"🔴 WS TICK STOPPED for token {token_id}")
+                    logger.warning(f"🔴 WS TICK STOPPED for token {token_id}")
                     try:
                         await heartbeat_task
                     except asyncio.CancelledError:
@@ -422,6 +441,8 @@ async def stream_orderbook(
             await asyncio.sleep(reconnect_delay)
 
     logger.info("WS stream stopped — token_id=%s", token_id)
+
+
 # ── Order placement ───────────────────────────────────────────────────────────
 
 
@@ -519,24 +540,3 @@ async def get_market_outcome(market_id: str, side: str) -> float:
     except Exception as exc:
         logger.error("get_market_outcome error: %s", exc)
         return 0.5
-
-
-# if __name__ == "__main__":
-#     import sys
-#     # Must configure logging BEFORE anything else runs
-#     logging.basicConfig(
-#         level=logging.DEBUG,
-#         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-#     )
-#     # Re-create the logger now that logging is configured
-#     logger = logging.getLogger(__name__)
-
-#     token_id = sys.argv[1] if len(sys.argv) > 1 else \
-#         "58569780351927609770409071492560642676500885849834275244155093807620690046332"
-
-#     stop = asyncio.Event()
-
-#     def on_price(bid, ask):
-#         print(f">>> TICK bid={bid:.4f} ask={ask:.4f}")
-
-#     asyncio.run(stream_orderbook(token_id, on_price, stop))
