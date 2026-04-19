@@ -11,6 +11,8 @@
 [![React](https://img.shields.io/badge/React-18-blue?logo=react)](https://react.dev/) 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-yellow?logo=fastapi)](https://fastapi.tiangolo.com/) 
 [![Supabase](https://img.shields.io/badge/Supabase-Postgres-purple?logo=supabase)](https://supabase.com/)
+[![Not Production Ready, Need some changes]([https://img.shields.io/badge/Supabase-Postgres-purple?logo=supabase](https://img.shields.io/badge/⚠️-Warning%20Not%20Production%20Ready-orange))
+
 
 **Polybot Phase 1** is a no-AI, rule-based automated trading system for Polymarket's Bitcoin 5-minute prediction markets. Launch via simple web app—select **Bot 1** (scalp cheap UP/DOWN shares to profit targets) or **Bot 2** (hold near-certain outcomes to $1 resolution). 32 files total: React/Tailwind UI, FastAPI backend, Supabase DB, Telegram alerts.
 
