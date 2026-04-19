@@ -1,4 +1,4 @@
-# Polybot Phase 1
+# Polybot Phase 1 (Not Production-Ready Yet - Needs polish before live)
 
 [![React](https://img.shields.io/badge/React-18-blue?logo=react)](https://react.dev/) 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-yellow?logo=fastapi)](https://fastapi.tiangolo.com/) 
