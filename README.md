@@ -1,17 +1,9 @@
 # Polybot Phase 1
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Status-MVP%20Working-brightgreen" alt="MVP Working">
-  <img src="https://img.shields.io/badge/⚠️-Warning%20Not%20Production%20Ready-orange" alt="Not Production Ready">
-  <img src="https://img.shields.io/badge/React-18-blue" alt="React">
-  <img src="https://img.shields.io/badge/FastAPI-yellow" alt="FastAPI">
-  <img src="https://img.shields.io/badge/Supabase-purple" alt="Supabase">
-</p>
-
 [![React](https://img.shields.io/badge/React-18-blue?logo=react)](https://react.dev/) 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-yellow?logo=fastapi)](https://fastapi.tiangolo.com/) 
 [![Supabase](https://img.shields.io/badge/Supabase-Postgres-purple?logo=supabase)](https://supabase.com/)
-[![Supabase](https://img.shields.io/badge/⚠️-Warning%20Not%20Production%20Ready-orange)](https://img.shields.io/badge/⚠️-Warning%20Not%20Production%20Ready-orange)
+[![Not Production-Ready Yet - Needs polish before live](https://img.shields.io/badge/⚠️-Warning%20Not%20Production%20Ready-orange)](https://img.shields.io/badge/⚠️-Warning%20Not%20Production%20Ready-orange)
 
 
 
