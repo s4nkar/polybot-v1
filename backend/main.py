@@ -42,7 +42,14 @@ from models.schemas import (
     TradeRecord,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("polybot.log", mode="w", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 # ── FastAPI app ───────────────────────────────────────────
@@ -124,6 +131,11 @@ async def broadcast(payload: Dict[str, Any]) -> None:
 
 
 # ── Routes ────────────────────────────────────────────────
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
 
 @app.post("/api/bot/start")
 async def start_bot(req: BotStartRequest) -> Dict[str, Any]:
@@ -320,4 +332,4 @@ async def ws_trades(ws: WebSocket) -> None:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("backend.main:app", host="::", port=8000, reload=True)

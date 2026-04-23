@@ -380,39 +380,39 @@ def _on_price_update(
       - best_bid <= stop_price    → STOP_LOSS
       - time remaining < time_stop_seconds → TIME_STOP
     """
-    logger.debug(
-        "WS tick — side=%s bid=%.4f ask=%.4f in_position=%s",
-        tick_side, best_bid, best_ask, state.in_position,
+    logger.warning(
+        "WS tick — side=%s bid=%.4f ask=%.4f in_position=%s entry_fired=%s trades=%d",
+        tick_side, best_bid, best_ask, state.in_position, state.entry_fired, state.trades_in_window,
     )
 
     if state.stop_event and state.stop_event.is_set():
         return
 
     loop = asyncio.get_event_loop()
-    # Add this before 'in_zone = ...'
-    logger.debug(f"DEBUG: Side {tick_side} Ask: {best_ask} | Zone: {params.entry_min}-{params.entry_max}")
     if not state.in_position:
         # ── Entry condition check ──────────────────────────────────────────
         if state.entry_fired:
             return  # already entering, wait for it to complete
 
         if state.trades_in_window >= state.max_trades_per_window:
-            logger.info(f"Trade limit reached ({state.trades_in_window}/{state.max_trades_per_window}) in market {state.market_id}")
+            logger.warning(f"Trade limit reached ({state.trades_in_window}/{state.max_trades_per_window}) in market {state.market_id}")
             return
-        
+
         in_zone = params.entry_min <= best_ask <= params.entry_max
+        logger.warning(f"Entry zone check: ask={best_ask:.4f} zone=[{params.entry_min},{params.entry_max}] in_zone={in_zone}")
 
         if in_zone:
-            state.in_position = True
+            # Mark entry in-flight FIRST so back-to-back ticks don't
+            # schedule a second _enter_trade before the first completes.
+            # in_position is NOT set here — it is set inside _enter_trade()
+            # only after validation passes and the order is confirmed.
+            state.entry_fired = True
             state.trades_in_window += 1
             state.side = tick_side
-            state.entry_price = best_ask
-            
-            logger.warning(f"✅ ENTRY LOCKED! price={best_ask:.4f}")
-            
-            # NOW schedule the async task (optional, for DB insert)
-            loop = asyncio.get_event_loop()
-            state.enter_task  = loop.create_task(
+
+            logger.warning(f"⚡ ENTRY TRIGGERED — price={best_ask:.4f}, scheduling order...")
+
+            state.enter_task = loop.create_task(
                 _enter_trade(
                     tick_side=tick_side,
                     indicative_ask=best_ask,
@@ -472,42 +472,50 @@ async def _enter_trade(
     """
     Open a position.
 
-    1. REST snapshot to get the exact live ask (WebSocket tick may be stale).
-    2. Re-validate the ask is still inside the entry zone.
-    3. Re-validate seconds remaining is sufficient.
-    4. Place BUY order.
-    5. Set TP / SL levels and mark position open.
+    1. Re-validate the indicative ask is still inside the entry zone.
+    2. Re-validate seconds remaining is sufficient.
+    3. Place BUY order.
+    4. Set TP / SL levels and mark position open (in_position = True set LAST).
+
+    All state mutations happen inside state.lock so concurrent tasks
+    from the dual stream never produce a half-initialised position.
     """
     try:
-        logger.warning(f"🔴 _enter_trade START — waiting for lock...")
         async with state.lock:
-            logger.warning(f"🔴 _enter_trade LOCK ACQUIRED")
+            # Guard: a concurrent _enter_trade task (e.g. from the other side's
+            # stream) may have already completed entry while we waited for the lock.
             if state.in_position:
-                logger.warning(f"🔴 _enter_trade EARLY RETURN — already in_position")
-                # Another tick triggered entry simultaneously — ignore.
-                return
+                logger.info("_enter_trade: already in position — skipping (concurrent entry)")
+                return  # finally block will undo trades_in_window and entry_fired
 
             token_to_buy = (
                 state.up_token_id if tick_side == "UP" else state.down_token_id
             )
-            logger.warning(f"🔴 _enter_trade PROCEEDING — token={token_to_buy}")
 
-            # Use indicative_ask from WS tick
+            # ── 1. Re-validate entry zone ──────────────────────────────────────
+            # The WS tick that triggered entry may be slightly stale; skip if the
+            # indicative price has drifted outside the zone.
             entry_price = indicative_ask
+            if not (params.entry_min <= entry_price <= params.entry_max):
+                logger.info(
+                    "Entry cancelled — price %.4f drifted outside zone [%.2f–%.2f]",
+                    entry_price, params.entry_min, params.entry_max,
+                )
+                return  # finally block handles cleanup
 
-            # ── 3. Re-validate time ────────────────────────────────────────────
+            # ── 2. Re-validate time remaining ─────────────────────────────────
             secs_rem = _seconds_remaining(state.end_date_str)
             if secs_rem < params.time_stop_seconds + 30:
                 logger.info(
                     "Entry cancelled — only %.0fs remaining (need %ds)",
                     secs_rem, params.time_stop_seconds + 30,
                 )
-                state.entry_fired = False
-                return
+                return  # finally block handles cleanup
 
             shares = round(params.amount_usd / entry_price, 4)
 
-            # ── 4. Place BUY order ─────────────────────────────────────────────
+            # ── 3. Place BUY order ─────────────────────────────────────────────
+            logger.warning(f"🔴 Placing BUY order — token={token_to_buy} price={entry_price:.4f}")
             order_result = await polymarket.place_order(
                 side="BUY",
                 amount=params.amount_usd,
@@ -516,16 +524,17 @@ async def _enter_trade(
                 dry_run=state.dry_run,
             )
 
-            # ── 5. Compute TP / SL levels and update state ────────────────────
-            # Fixed-cents strategy: TP and SL are absolute price levels derived
-            # from exact entry price.  Clamped to valid binary range (0.02–0.98).
-            target_price = min(entry_price + (params.take_profit_cents / 100), 0.98)
-            stop_price = max(entry_price - (params.stop_loss_cents / 100), 0.02)
+            # ── 4. Compute TP / SL levels ──────────────────────────────────────
+            target_price = min(entry_price + params.take_profit_cents, 0.98)
+            stop_price   = max(entry_price - params.stop_loss_cents, 0.02)
 
             trade_id = str(uuid.uuid4())
             now_iso  = datetime.now(timezone.utc).isoformat()
 
-            state.in_position   = True
+            # ── 5. Commit all position state atomically ────────────────────────
+            # Set every field BEFORE setting in_position=True so that the
+            # position-monitoring branch in _on_price_update never sees a
+            # half-initialised state (e.g. target_price still at 0.0).
             state.trade_id      = trade_id
             state.side          = tick_side
             state.token_to_buy  = token_to_buy
@@ -535,6 +544,7 @@ async def _enter_trade(
             state.stop_price    = stop_price
             state.exit_fired    = False
             state.round_num    += 1
+            state.in_position   = True   # ← set LAST; enables position monitoring
 
             trade_record = {
                 "id":              trade_id,
@@ -561,8 +571,11 @@ async def _enter_trade(
                 "updated_at":      now_iso,
             }
             logger.warning(f"🔴 INSERTING TRADE: {trade_record}")
-            db.insert_trade(trade_record)
-            logger.warning(f"✅ TRADE INSERTED: {trade_id}")
+            try:
+                db.insert_trade(trade_record)
+                logger.warning(f"✅ TRADE INSERTED: {trade_id}")
+            except Exception as db_exc:
+                logger.error("DB insert failed (position still open): %s", db_exc)
 
             await telegram.trade_opened_bot1(
                 side=tick_side,
@@ -589,11 +602,15 @@ async def _enter_trade(
                 trade_id, tick_side, entry_price, target_price, stop_price,
             )
     except Exception as exc:
-        logger.error(f"❌ CRITICAL ENTRY ERROR: {exc}", exc_info=True)
+        logger.error("❌ CRITICAL ENTRY ERROR: %s", exc, exc_info=True)
     finally:
+        # If the entry did not complete successfully, undo the slot reservation
+        # and clear the in-flight flag so the bot can try again on the next tick.
         if not state.in_position:
-            logger.warning(f"🔴 finally block — resetting entry_fired")
+            state.trades_in_window = max(0, state.trades_in_window - 1)
             state.entry_fired = False
+
+
 async def _exit_trade(
     exit_reason: str,
     current_bid: float,
@@ -666,7 +683,10 @@ async def _exit_trade(
             "closed_at":     datetime.now(timezone.utc).isoformat(),
             "error_message": exit_reason,
         }
-        db.update_trade(trade_id, trade_updates)
+        try:
+            db.update_trade(trade_id, trade_updates)
+        except Exception as db_exc:
+            logger.error("DB update failed (position will still close): %s", db_exc)
 
         # ── Telegram alert ────────────────────────────────────────────────
         if status == "WIN":

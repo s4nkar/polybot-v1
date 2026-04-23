@@ -355,7 +355,8 @@ async def stream_orderbook(
                             break
                         tick_count += 1
 
-                        # logger.warning(f"🔴 WS TICK #{tick_count} token={token_id[:20]}... raw={str(raw)[:200]}")
+                        if tick_count <= 3:
+                            logger.warning(f"🔴 WS RAW #{tick_count}: {str(raw)[:600]}")
 
                         # Server echoes "PONG" for our "PING" — skip it
                         if raw == "PONG":
@@ -376,7 +377,8 @@ async def stream_orderbook(
                                 asks = event.get("asks", [])
                                 try:
                                     best_bid = float(bids[-1]["price"]) if bids else 0.0
-                                    best_ask = float(asks[0]["price"]) if asks else 0.0
+                                    # WS sends asks descending (highest first); best ask = last element
+                                    best_ask = float(asks[-1]["price"]) if asks else 0.0
                                     if best_bid > 0.0 or best_ask > 0.0:
                                         logger.warning(f"📊 BOOK SNAPSHOT: bid={best_bid:.4f} ask={best_ask:.4f}")
                                         on_price(best_bid, best_ask)
@@ -390,34 +392,28 @@ async def stream_orderbook(
                             if price_changes:
                                 for change in price_changes:
                                     try:
-                                        asset_id = change.get("asset_id", "")
-                                        price_str = change.get("price", "")
-                                        
-                                        if not price_str:
+                                        if change.get("asset_id", "") != token_id:
                                             continue
-                                        
-                                        price = float(price_str)
-                                        if price <= 0.0:
-                                            continue
-                                        
-                                        # Fire only when this change belongs to our subscribed token_id
-                                        if asset_id == token_id:
-                                            # logger.info(f"💰 PRICE CHANGE: price={price:.4f} asset={asset_id[:20]}...")
-                                            on_price(price, price)
+                                        # Prefer real book prices over individual fill price
+                                        best_bid = float(change.get("best_bid") or 0)
+                                        best_ask = float(change.get("best_ask") or 0)
+                                        if best_bid > 0.0 or best_ask > 0.0:
+                                            logger.debug(f"💰 price_changes: bid={best_bid:.4f} ask={best_ask:.4f}")
+                                            on_price(best_bid, best_ask)
                                     except (ValueError, TypeError) as e:
                                         logger.debug(f"Price change parse error: {e}")
                                 continue
 
-                            # ── LAST TRADE PRICE ──────────────────────────────
+                            # ── PRICE CHANGE / LAST TRADE PRICE ──────────────
                             etype = event.get("event_type", event.get("type", ""))
-                            if etype == "last_trade_price":
+                            if etype in ("last_trade_price", "price_change"):
                                 try:
                                     price = float(event.get("price") or 0)
                                     if price > 0.0:
-                                        logger.info(f"🔄 LAST TRADE PRICE: {price:.4f}")
+                                        logger.warning(f"💰 TICK {etype}: price={price:.4f}")
                                         on_price(price, price)
                                 except (ValueError, TypeError) as e:
-                                    logger.debug(f"Last trade price parse error: {e}")
+                                    logger.debug(f"Price event parse error: {e}")
 
                 finally:
                     heartbeat_task.cancel()
