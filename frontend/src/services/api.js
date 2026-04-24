@@ -45,12 +45,18 @@ export async function getTrades() {
 
 // ── Trade history & analytics ────────────────────────────
 
-export async function getAllTrades(limit = 50, offset = 0, mode = "all") {
-  return request(`/api/trades/all?limit=${limit}&offset=${offset}&mode=${mode}`);
+export async function getAllTrades(limit = 50, offset = 0, mode = "all", dateFrom = null, dateTo = null) {
+  let url = `/api/trades/all?limit=${limit}&offset=${offset}&mode=${mode}`;
+  if (dateFrom) url += `&date_from=${encodeURIComponent(dateFrom)}`;
+  if (dateTo) url += `&date_to=${encodeURIComponent(dateTo)}`;
+  return request(url);
 }
 
-export async function getAnalytics(mode = "all") {
-  return request(`/api/analytics?mode=${mode}`);
+export async function getAnalytics(mode = "all", dateFrom = null, dateTo = null) {
+  let url = `/api/analytics?mode=${mode}`;
+  if (dateFrom) url += `&date_from=${encodeURIComponent(dateFrom)}`;
+  if (dateTo) url += `&date_to=${encodeURIComponent(dateTo)}`;
+  return request(url);
 }
 
 // ── Config endpoints ─────────────────────────────────────

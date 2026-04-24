@@ -70,11 +70,20 @@ class _MemoryDB:
         return result
 
     def get_all_trades(
-        self, limit: int = 50, offset: int = 0, trading_mode: Optional[str] = None
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        trading_mode: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         filtered = self.trades
         if trading_mode:
             filtered = [t for t in filtered if t.get("trading_mode") == trading_mode]
+        if date_from:
+            filtered = [t for t in filtered if (t.get("created_at") or "") >= date_from]
+        if date_to:
+            filtered = [t for t in filtered if (t.get("created_at") or "") <= date_to]
         filtered.sort(key=lambda t: t.get("created_at", ""), reverse=True)
         total = len(filtered)
         return (filtered[offset : offset + limit], total)
@@ -157,19 +166,25 @@ def get_all_trades(
     limit: int = 50,
     offset: int = 0,
     trading_mode: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Return paginated trades across all sessions, newest first.
 
     Returns (trades_list, total_count).
     """
     if not _USE_SUPABASE:
-        return _memdb.get_all_trades(limit, offset, trading_mode)
+        return _memdb.get_all_trades(limit, offset, trading_mode, date_from, date_to)
 
     client = _get_client()
     try:
         query = client.table("trades").select("*", count="exact")
         if trading_mode and trading_mode in ("live", "paper"):
             query = query.eq("trading_mode", trading_mode)
+        if date_from:
+            query = query.gte("created_at", date_from)
+        if date_to:
+            query = query.lte("created_at", date_to)
         query = query.order("created_at", desc=True)
         query = query.range(offset, offset + limit - 1)
         result = query.execute()
@@ -180,13 +195,17 @@ def get_all_trades(
         return ([], 0)
 
 
-def get_analytics_summary(trading_mode: Optional[str] = None) -> Dict[str, Any]:
+def get_analytics_summary(
+    trading_mode: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Dict[str, Any]:
     """Compute aggregated analytics from the trades table.
 
     Returns a dict matching the AnalyticsSummary model.
     """
     if not _USE_SUPABASE:
-        trades_list, _ = _memdb.get_all_trades(limit=999999, trading_mode=trading_mode)
+        trades_list, _ = _memdb.get_all_trades(limit=999999, trading_mode=trading_mode, date_from=date_from, date_to=date_to)
         trades = trades_list
     else:
         client = _get_client()
@@ -194,6 +213,10 @@ def get_analytics_summary(trading_mode: Optional[str] = None) -> Dict[str, Any]:
             query = client.table("trades").select("*")
             if trading_mode and trading_mode in ("live", "paper"):
                 query = query.eq("trading_mode", trading_mode)
+            if date_from:
+                query = query.gte("created_at", date_from)
+            if date_to:
+                query = query.lte("created_at", date_to)
             result = query.execute()
             trades = result.data or []
         except Exception as exc:

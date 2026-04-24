@@ -6,10 +6,9 @@ import Settings from "./pages/Settings";
 
 export default function App() {
   const navLinkCls = ({ isActive }) =>
-    `px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
-      isActive
-        ? "bg-brand-500/15 text-brand-400"
-        : "text-surface-400 hover:text-surface-200 hover:bg-surface-800"
+    `px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${isActive
+      ? "bg-brand-500/15 text-brand-400"
+      : "text-surface-400 hover:text-surface-200 hover:bg-surface-800"
     }`;
 
   return (
@@ -43,7 +42,7 @@ export default function App() {
         </nav>
 
         {/* Main content */}
-        <main className="mx-auto max-w-5xl px-6 py-8">
+        <main className="mx-auto max-w-6xl px-6 py-8">
           <Routes>
             <Route path="/" element={<Launcher />} />
             <Route path="/analytics" element={<Analytics />} />

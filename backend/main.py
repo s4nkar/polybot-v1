@@ -257,20 +257,24 @@ async def get_all_trades(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     mode: str = Query("all", regex="^(all|live|paper)$"),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
 ) -> TradeListResponse:
     """Return paginated trade history across all sessions."""
     trading_mode = mode if mode != "all" else None
-    trades, total = db.get_all_trades(limit=limit, offset=offset, trading_mode=trading_mode)
+    trades, total = db.get_all_trades(limit=limit, offset=offset, trading_mode=trading_mode, date_from=date_from, date_to=date_to)
     return TradeListResponse(trades=trades, total=total, limit=limit, offset=offset)
 
 
 @app.get("/api/analytics")
 async def get_analytics(
     mode: str = Query("all", regex="^(all|live|paper)$"),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
 ) -> AnalyticsSummary:
     """Return aggregated analytics across all trades."""
     trading_mode = mode if mode != "all" else None
-    summary = db.get_analytics_summary(trading_mode=trading_mode)
+    summary = db.get_analytics_summary(trading_mode=trading_mode, date_from=date_from, date_to=date_to)
     return AnalyticsSummary(**summary)
 
 
