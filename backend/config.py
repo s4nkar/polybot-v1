@@ -27,7 +27,7 @@ class Settings:
     BINANCE_BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 
     # ── Chainlink (Polygon) ───────────────────────────────
-    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://rpc.ankr.com/polygon")
     CHAINLINK_BTC_USD_ADDRESS: str = os.getenv(
         "CHAINLINK_BTC_USD_ADDRESS",
         "0xc907E116054Ad103354f2D350FD2514433D57F6F",

@@ -1,16 +1,17 @@
 """
 Polybot — Bot 2: Hold to Resolution.
 
-Full execution loop (PRD section 4.3):
-  1. Scan for eligible 5-min BTC windows (poll every 5 s)
-  2. Get BTC price from Chainlink (NOT Binance)
-  3. Check gap % — must exceed min_gap_pct
-  4. Check odds — entry price must be ≤ max_entry_price
-  5. Buy UP or DOWN tokens
-  6. Wait for market resolution (never sell)
-  7. Collect payout at resolution
-  8. Log trade to DB
-  9. Send Telegram alert
+Strategy
+--------
+  1. Scan for active 5-min BTC market once per minute (scanner loop).
+  2. Validate market is not resolved and has enough time remaining.
+  3. Get BTC price from Chainlink.
+  4. Check gap % against nearest $100 round number — must exceed min_gap_pct.
+  5. Check best_ask odds — must be ≤ max_entry_price.
+  6. Place BUY order.
+  7. Sleep until market window closes (end_date).
+  8. Poll get_market_outcome() for the resolved outcome price.
+  9. Calculate P&L, update DB, send Telegram alert.
   Repeat until stop_event is set or max_rounds reached.
 
 IMPORTANT:
@@ -23,14 +24,15 @@ IMPORTANT:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from db import supabase as db
 from models.schemas import Bot2Params
-from services import chainlink, polymarket, telegram
+from services import chainlink, polymarket_v2 as polymarket, telegram
 
 logger = logging.getLogger(__name__)
 
@@ -44,248 +46,374 @@ async def run_bot2(
     trading_mode: str = "paper",
     status_update: Optional[Callable] = None,
 ) -> None:
-    """
-    Main loop for Bot 2 — Hold to Resolution.
-
-    *broadcast* is an optional async callback to push trade updates to
-    WebSocket clients.
-    """
-    bot_id = "bot2"
+    bot_id    = "bot2"
     round_num = 0
 
     await telegram.bot_started(bot_id, dry_run, params.model_dump())
     logger.info("Bot2 started — session=%s dry_run=%s", session_id, dry_run)
 
+    last_telegram_skip = 0.0
+
+    async def maybe_skip(reason: str) -> None:
+        nonlocal last_telegram_skip
+        import time
+        ts = time.time()
+        if ts - last_telegram_skip > 60:
+            await telegram.trade_skipped(bot_id, reason)
+            last_telegram_skip = ts
+        logger.warning("Bot2 skip: %s", reason)
+
     while not stop_event.is_set():
-        round_num += 1
-        if params.max_rounds and round_num > params.max_rounds:
+
+        if params.max_rounds and round_num >= params.max_rounds:
             logger.info("Bot2 reached max_rounds=%d — stopping.", params.max_rounds)
             break
 
+        _status(status_update, f"Scanning for active market… (round {round_num + 1})", round_num)
+
+        # ── Step 1: Discover the active market ────────────────────────────────
         try:
-            # ── Step 1: Scan for active markets ───────────────
-            if status_update:
-                status_update(f"Round {round_num}: Scanning for active markets…", round_num)
             markets = await polymarket.get_active_markets(params.market_slug)
-            if not markets:
-                logger.info("Bot2: No active markets — waiting 5 s")
-                if status_update:
-                    status_update(f"Round {round_num}: No active markets — waiting 5 s", round_num)
-                await asyncio.sleep(5)
-                continue
-
-            market = markets[0]
-            market_id = market.get("condition_id", market.get("id", "unknown"))
-            tokens = market.get("tokens", [])
-
-            # Determine UP/DOWN token IDs
-            up_token_id = None
-            down_token_id = None
-            for tok in tokens:
-                outcome = (tok.get("outcome") or tok.get("name", "")).upper()
-                if "UP" in outcome or "YES" in outcome:
-                    up_token_id = tok.get("token_id", "")
-                elif "DOWN" in outcome or "NO" in outcome:
-                    down_token_id = tok.get("token_id", "")
-
-            if not up_token_id and not down_token_id:
-                up_token_id = market_id
-                down_token_id = market_id
-
-            # ── Step 2: Get BTC price from Chainlink ──────────
-            try:
-                btc_price = await chainlink.get_btc_price()
-            except Exception as exc:
-                logger.error("Chainlink price error: %s", exc)
-                if status_update:
-                    status_update(f"Round {round_num}: Chainlink error — retrying in 5 s", round_num)
-                await telegram.api_error(bot_id, "chainlink", str(exc))
-                await asyncio.sleep(5)
-                continue
-
-            # ── Step 3: Calculate gap % ───────────────────────
-            # Gap relative to the nearest $100 round number
-            round_price = round(btc_price / 100) * 100
-            gap_abs = abs(btc_price - round_price)
-            gap_pct = (gap_abs / btc_price) * 100 if btc_price > 0 else 0.0
-
-            if gap_pct < params.min_gap_pct:
-                reason = f"Gap {gap_pct:.4f}% < min {params.min_gap_pct}%"
-                logger.info("Bot2 skip: %s", reason)
-                if status_update:
-                    status_update(f"Round {round_num}: Skipped — {reason}", round_num)
-                await telegram.trade_skipped(bot_id, reason)
-                await asyncio.sleep(5)
-                continue
-
-            # Determine direction from BTC price relative to round
-            side = "UP" if btc_price > round_price else "DOWN"
-            token_to_buy = up_token_id if side == "UP" else down_token_id
-
-            # ── Step 4: Check odds / entry price ──────────────
-            order_book = await polymarket.get_orderbook(token_to_buy)
-            entry_price = order_book["best_ask"]
-
-            if entry_price <= 0 or entry_price > params.max_entry_price:
-                reason = f"Entry price {entry_price:.4f} exceeds max {params.max_entry_price}"
-                logger.info("Bot2 skip: %s", reason)
-                await telegram.trade_skipped(bot_id, reason)
-                await asyncio.sleep(5)
-                continue
-
-            shares = round(params.amount_usd / entry_price, 4)
-
-            # ── Step 5: Place buy order ───────────────────────
-            order_result = await polymarket.place_order(
-                side="BUY",
-                amount=params.amount_usd,
-                price=entry_price,
-                token_id=token_to_buy,
-                dry_run=dry_run,
-            )
-
-            trade_id = str(uuid.uuid4())
-            now = datetime.now(timezone.utc).isoformat()
-
-            trade_record = {
-                "id": trade_id,
-                "session_id": session_id,
-                "bot_id": bot_id,
-                "market_id": market_id,
-                "market_slug": params.market_slug,
-                "side": side,
-                "entry_price": float(entry_price),
-                "shares": float(shares),
-                "amount_usd": float(params.amount_usd),
-                "signal_score": None,
-                "btc_price_entry": float(btc_price),
-                "dry_run": dry_run,
-                "trading_mode": trading_mode,
-                "status": "OPEN",
-                "opened_at": now,
-                "created_at": now,
-                "updated_at": now,
-            }
-            db.insert_trade(trade_record)
-
-            await telegram.trade_opened_bot2(
-                side=side,
-                entry_price=entry_price,
-                shares=shares,
-                amount_usd=params.amount_usd,
-                gap_pct=gap_pct,
-                market_id=market_id,
-                dry_run=dry_run,
-            )
-
-            if broadcast:
-                await broadcast({"type": "trade_opened", "trade": trade_record})
-
-            if status_update:
-                status_update(f"Round {round_num}: Trade opened — {side} @ ${entry_price:.4f}, waiting for resolution…", round_num)
-
-            # ── Step 6: Wait for resolution ───────────────────
-            # Bot 2 holds until market resolves — poll every 5 s
-            # In dry-run, simulate waiting 60 s then resolving based on probability.
-            resolution_price: Optional[float] = None
-
-            if dry_run:
-                # Simulate waiting for resolution
-                wait_seconds = 60
-                elapsed = 0
-                while elapsed < wait_seconds and not stop_event.is_set():
-                    await asyncio.sleep(5)
-                    elapsed += 5
-
-                # Simulate resolution: if entry_price < 0.5, likely a
-                # good-value bet → simulate WIN, else LOSS
-                import random
-                win_probability = 1.0 - entry_price  # cheaper entry = higher win prob
-                won = random.random() < win_probability
-                resolution_price = 1.0 if won else 0.0
-            else:
-                # Live: poll market status until resolved
-                while not stop_event.is_set():
-                    await asyncio.sleep(5)
-                    try:
-                        updated_markets = await polymarket.get_active_markets(params.market_slug)
-                        # Check if our market is still active
-                        still_active = any(
-                            m.get("condition_id") == market_id or m.get("id") == market_id
-                            for m in updated_markets
-                        )
-                        if not still_active:
-                            # Market resolved — check final price
-                            ob = await polymarket.get_orderbook(token_to_buy)
-                            final_price = ob.get("best_bid", 0.0)
-                            # If price ≈ 1.0 we won, if ≈ 0.0 we lost
-                            resolution_price = 1.0 if final_price > 0.5 else 0.0
-                            break
-                    except Exception as poll_exc:
-                        logger.warning("Resolution poll error: %s", poll_exc)
-
-            if resolution_price is None:
-                # Bot was stopped before resolution
-                resolution_price = 0.0
-                logger.info("Bot2 stopped before resolution — treating as loss")
-
-            # ── Step 7–8: Calculate P&L and log ───────────────
-            if resolution_price >= 0.5:
-                # WIN
-                pnl_usd = (1.0 - entry_price) * shares
-                exit_price = 1.0
-                status = "WIN"
-            else:
-                # LOSS
-                pnl_usd = -(entry_price * shares)
-                exit_price = 0.0
-                status = "LOSS"
-
-            pnl_pct = (pnl_usd / params.amount_usd * 100) if params.amount_usd > 0 else 0.0
-
-            btc_price_exit = 0.0
-            try:
-                btc_price_exit = await chainlink.get_btc_price()
-            except Exception:
-                pass
-
-            trade_updates = {
-                "exit_price": float(exit_price),
-                "pnl_usd": round(float(pnl_usd), 4),
-                "pnl_pct": round(float(pnl_pct), 4),
-                "status": status,
-                "btc_price_exit": float(btc_price_exit),
-                "closed_at": datetime.now(timezone.utc).isoformat(),
-            }
-            db.update_trade(trade_id, trade_updates)
-
-            # ── Step 9: Telegram alert ────────────────────────
-            if status == "WIN":
-                await telegram.trade_won(bot_id, entry_price, exit_price, pnl_usd, pnl_pct)
-            else:
-                await telegram.trade_lost(bot_id, entry_price, exit_price, pnl_usd, pnl_pct)
-
-            if broadcast:
-                trade_record.update(trade_updates)
-                await broadcast({"type": "trade_closed", "trade": trade_record})
-
-            # Wait 5 minutes before next trade round
-            logger.info("Bot2 waiting 5 min before next round…")
-            for _ in range(60):  # 60 × 5s = 300s, checking stop_event every 5s
-                if stop_event.is_set():
-                    break
-                await asyncio.sleep(5)
-
-        except asyncio.CancelledError:
-            logger.info("Bot2 task cancelled.")
-            break
         except Exception as exc:
-            logger.error("Bot2 loop error: %s", exc)
-            await telegram.api_error(bot_id, "bot2_loop", str(exc))
-            await asyncio.sleep(5)
+            logger.error("Market scan error: %s", exc)
+            await _interruptible_sleep(10, stop_event)
+            continue
 
-    # ── Session complete ──────────────────────────────────
+        if not markets:
+            await maybe_skip("No active markets found")
+            _status(status_update, "No active market — retrying in 15 s", round_num)
+            await _interruptible_sleep(15, stop_event)
+            continue
+
+        market    = markets[0]
+        market_id = market.get("condition_id", market.get("id", ""))
+
+        # ── Step 2: Extract token IDs ──────────────────────────────────────────
+        up_token_id, down_token_id = _extract_token_ids(market)
+
+        if not up_token_id or not down_token_id:
+            await maybe_skip(f"Could not extract token IDs from market {market_id}")
+            await _interruptible_sleep(10, stop_event)
+            continue
+
+        # ── Step 3: Validate outcomePrices (skip resolved markets) ────────────
+        up_price, down_price, prices_ok = _parse_outcome_prices(market)
+
+        if prices_ok and (up_price >= 0.99 or up_price <= 0.01 or down_price >= 0.99 or down_price <= 0.01):
+            await maybe_skip(
+                f"Market looks resolved (UP={up_price:.4f} DOWN={down_price:.4f})"
+            )
+            await _interruptible_sleep(10, stop_event)
+            continue
+
+        # ── Step 4: Validate time remaining ───────────────────────────────────
+        seconds_remaining = market.get("seconds_remaining", 0.0)
+
+        # Need at least 60 s to enter — otherwise resolution could come before
+        # the order even settles.
+        if seconds_remaining < 60:
+            msg = (
+                f"Market window too short ({seconds_remaining:.0f}s remaining, "
+                f"need 60s) — waiting for next window"
+            )
+            logger.warning(msg)
+            _status(status_update, msg, round_num)
+            await _interruptible_sleep(max(5, int(seconds_remaining) + 5), stop_event)
+            continue
+
+        # ── Step 5: Get BTC price from Chainlink ──────────────────────────────
+        try:
+            btc_price = await chainlink.get_btc_price()
+        except Exception as exc:
+            logger.error("Chainlink price error: %s", exc)
+            _status(status_update, "Chainlink error — retrying in 5 s", round_num)
+            await telegram.api_error(bot_id, "chainlink", str(exc))
+            await _interruptible_sleep(5, stop_event)
+            continue
+
+        # ── Step 6: Calculate gap % ───────────────────────────────────────────
+        # Round to nearest $1000 — gives a max gap of ~$500 (~0.5% at $95k BTC),
+        # which is a workable range for the min_gap_pct filter.
+        round_price = round(btc_price / 1000) * 1000
+        gap_abs     = abs(btc_price - round_price)
+        gap_pct     = (gap_abs / btc_price) * 100 if btc_price > 0 else 0.0
+
+        logger.warning(
+            "Bot2 gap check — BTC=%.2f round=%.0f gap=%.4f%% min=%.4f%%",
+            btc_price, round_price, gap_pct, params.min_gap_pct,
+        )
+
+        if gap_pct < params.min_gap_pct:
+            reason = f"Gap {gap_pct:.4f}% < min {params.min_gap_pct}%"
+            await maybe_skip(reason)
+            _status(status_update, f"Skipped — {reason}", round_num)
+            await _interruptible_sleep(5, stop_event)
+            continue
+
+        side         = "UP" if btc_price > round_price else "DOWN"
+        token_to_buy = up_token_id if side == "UP" else down_token_id
+
+        # ── Step 7: Check odds / entry price ──────────────────────────────────
+        try:
+            order_book = await polymarket.get_orderbook(token_to_buy)
+        except Exception as exc:
+            logger.error("Orderbook fetch error: %s", exc)
+            await _interruptible_sleep(5, stop_event)
+            continue
+
+        entry_price = order_book["best_ask"]
+
+        logger.warning(
+            "Bot2 entry check — side=%s ask=%.4f max=%.4f",
+            side, entry_price, params.max_entry_price,
+        )
+
+        if entry_price <= 0 or entry_price > params.max_entry_price:
+            reason = f"Entry price {entry_price:.4f} exceeds max {params.max_entry_price}"
+            await maybe_skip(reason)
+            await _interruptible_sleep(5, stop_event)
+            continue
+
+        shares = round(params.amount_usd / entry_price, 4)
+
+        # ── Step 8: Place BUY order ────────────────────────────────────────────
+        logger.info("Placing BUY order — token=%s price=%.4f", token_to_buy, entry_price)
+        order_result = await polymarket.place_order(
+            side="BUY",
+            amount=params.amount_usd,
+            price=entry_price,
+            token_id=token_to_buy,
+            dry_run=dry_run,
+        )
+
+        round_num += 1
+        trade_id  = str(uuid.uuid4())
+        now       = datetime.now(timezone.utc).isoformat()
+
+        trade_record = {
+            "id":              trade_id,
+            "session_id":      session_id,
+            "bot_id":          bot_id,
+            "market_id":       market_id,
+            "market_slug":     params.market_slug,
+            "side":            side,
+            "entry_price":     float(entry_price),
+            "shares":          float(shares),
+            "amount_usd":      float(params.amount_usd),
+            "signal_score":    None,
+            "order_id":        order_result.get("order_id", ""),
+            "token_id":        token_to_buy,
+            "btc_price_entry": float(btc_price),
+            "dry_run":         dry_run,
+            "trading_mode":    trading_mode,
+            "status":          "OPEN",
+            "opened_at":       now,
+            "created_at":      now,
+            "updated_at":      now,
+        }
+
+        try:
+            db.insert_trade(trade_record)
+        except Exception as db_exc:
+            logger.error("DB insert failed: %s", db_exc)
+
+        await telegram.trade_opened_bot2(
+            side=side,
+            entry_price=entry_price,
+            shares=shares,
+            amount_usd=params.amount_usd,
+            gap_pct=gap_pct,
+            market_id=market_id,
+            dry_run=dry_run,
+        )
+
+        if broadcast:
+            await broadcast({"type": "trade_opened", "trade": trade_record})
+
+        _status(
+            status_update,
+            f"ENTERED {side} @ {entry_price:.4f} | BTC={btc_price:.0f} gap={gap_pct:.3f}% | "
+            f"waiting {seconds_remaining:.0f}s for resolution…",
+            round_num,
+        )
+        logger.info(
+            "Trade opened — id=%s side=%s entry=%.4f BTC=%.2f gap=%.4f%%",
+            trade_id, side, entry_price, btc_price, gap_pct,
+        )
+
+        # ── Step 9: Wait for resolution ────────────────────────────────────────
+        resolution_price: Optional[float] = None
+
+        if dry_run:
+            import random
+            # In dry-run cap wait to 30 s so testing stays fast.
+            wait_secs = min(seconds_remaining, 30.0)
+            await _interruptible_sleep(wait_secs, stop_event)
+            win_prob         = 1.0 - entry_price  # cheaper entry → higher win prob
+            resolution_price = 1.0 if random.random() < win_prob else 0.0
+        else:
+            # Sleep until the market window closes, then poll for outcome.
+            secs_to_wait = max(seconds_remaining + 5, 5.0)
+            logger.info("Bot2 waiting %.0fs for market to close…", secs_to_wait)
+            _status(status_update, f"Waiting {secs_to_wait:.0f}s for market to close…", round_num)
+            await _interruptible_sleep(secs_to_wait, stop_event)
+
+            if not stop_event.is_set():
+                # Poll get_market_outcome up to 60 s post-close for settlement.
+                for attempt in range(12):
+                    try:
+                        outcome = await polymarket.get_market_outcome(market_id, side)
+                        if outcome >= 0.99:
+                            resolution_price = 1.0
+                            break
+                        elif outcome <= 0.01:
+                            resolution_price = 0.0
+                            break
+                        logger.info(
+                            "Bot2 outcome not yet settled (%.4f) — retry %d/12",
+                            outcome, attempt + 1,
+                        )
+                    except Exception as exc:
+                        logger.warning("get_market_outcome error: %s", exc)
+                    await _interruptible_sleep(5, stop_event)
+                    if stop_event.is_set():
+                        break
+
+                # Fallback: read orderbook — resolved markets show bid near 0 or 1.
+                if resolution_price is None and not stop_event.is_set():
+                    try:
+                        ob        = await polymarket.get_orderbook(token_to_buy)
+                        final_bid = ob.get("best_bid", 0.0)
+                        resolution_price = 1.0 if final_bid > 0.5 else 0.0
+                        logger.info(
+                            "Bot2 resolution fallback via orderbook: bid=%.4f → %.1f",
+                            final_bid, resolution_price,
+                        )
+                    except Exception:
+                        resolution_price = 0.0
+
+        if resolution_price is None:
+            resolution_price = 0.0
+            logger.info("Bot2 stopped before resolution — treating as loss")
+
+        # ── Step 10: Calculate P&L ────────────────────────────────────────────
+        if resolution_price >= 0.5:
+            pnl_usd    = (1.0 - entry_price) * shares
+            exit_price = 1.0
+            status     = "WIN"
+        else:
+            pnl_usd    = -(entry_price * shares)
+            exit_price = 0.0
+            status     = "LOSS"
+
+        pnl_pct = (pnl_usd / params.amount_usd * 100) if params.amount_usd > 0 else 0.0
+
+        btc_price_exit = 0.0
+        try:
+            btc_price_exit = await chainlink.get_btc_price()
+        except Exception:
+            pass
+
+        trade_updates = {
+            "exit_price":     float(exit_price),
+            "pnl_usd":        round(float(pnl_usd), 4),
+            "pnl_pct":        round(float(pnl_pct), 4),
+            "status":         status,
+            "btc_price_exit": float(btc_price_exit),
+            "closed_at":      datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            db.update_trade(trade_id, trade_updates)
+        except Exception as db_exc:
+            logger.error("DB update failed: %s", db_exc)
+
+        # ── Step 11: Telegram alert ────────────────────────────────────────────
+        if status == "WIN":
+            await telegram.trade_won(bot_id, entry_price, exit_price, pnl_usd, pnl_pct)
+        else:
+            await telegram.trade_lost(bot_id, entry_price, exit_price, pnl_usd, pnl_pct)
+
+        if broadcast:
+            await broadcast({"type": "trade_closed", "trade": {**trade_record, **trade_updates}})
+
+        _status(
+            status_update,
+            f"EXIT {status} | {side} | entry={entry_price:.4f} "
+            f"pnl={pnl_usd:+.4f} USD ({pnl_pct:+.2f}%)",
+            round_num,
+        )
+        logger.info("Trade closed — id=%s status=%s pnl=%.4f", trade_id, status, pnl_usd)
+
+        # Brief pause before scanning for the next window.
+        await _interruptible_sleep(5, stop_event)
+
+    # ── Session complete ───────────────────────────────────────────────────────
     session_trades = db.get_session_trades(session_id)
-    total_pnl = sum(float(t.get("pnl_usd", 0) or 0) for t in session_trades)
+    total_pnl      = sum(float(t.get("pnl_usd", 0) or 0) for t in session_trades)
     await telegram.bot_stopped(bot_id, len(session_trades), total_pnl)
-    logger.info("Bot2 stopped — session=%s trades=%d pnl=%.4f", session_id, len(session_trades), total_pnl)
+    logger.info(
+        "Bot2 stopped — session=%s trades=%d pnl=%.4f",
+        session_id, len(session_trades), total_pnl,
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _extract_token_ids(market: Dict[str, Any]) -> tuple[str, str]:
+    """Return (up_token_id, down_token_id) from a market dict."""
+    tokens        = market.get("tokens", [])
+    up_token_id   = ""
+    down_token_id = ""
+
+    for tok in tokens:
+        outcome = (tok.get("outcome") or tok.get("name", "")).upper()
+        if "UP" in outcome or "YES" in outcome:
+            up_token_id = tok.get("token_id", "")
+        elif "DOWN" in outcome or "NO" in outcome:
+            down_token_id = tok.get("token_id", "")
+
+    if not up_token_id or not down_token_id:
+        raw = market.get("clobTokenIds", "[]")
+        try:
+            ids = json.loads(raw) if isinstance(raw, str) else raw
+            if len(ids) >= 2:
+                up_token_id   = ids[0]
+                down_token_id = ids[1]
+        except Exception:
+            pass
+
+    return up_token_id, down_token_id
+
+
+def _parse_outcome_prices(market: Dict[str, Any]) -> tuple[float, float, bool]:
+    """Parse outcomePrices. Returns (up_price, down_price, success_bool)."""
+    try:
+        raw    = market.get("outcomePrices", "[]")
+        prices = json.loads(raw) if isinstance(raw, str) else raw
+        if len(prices) >= 2:
+            up   = float(prices[0])
+            down = float(prices[1])
+            if up == 0.0 and down == 0.0:
+                return 0.0, 0.0, False
+            return up, down, True
+    except Exception:
+        pass
+    return 0.0, 0.0, False
+
+
+def _status(cb: Optional[Callable], msg: str, round_num: int) -> None:
+    """Fire the optional status_update callback (non-blocking)."""
+    if cb:
+        try:
+            cb(msg, round_num)
+        except Exception:
+            pass
+
+
+async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> None:
+    """Sleep for `seconds` but wake immediately if stop_event fires."""
+    elapsed = 0.0
+    while elapsed < seconds and not stop_event.is_set():
+        await asyncio.sleep(min(2.0, seconds - elapsed))
+        elapsed += 2.0

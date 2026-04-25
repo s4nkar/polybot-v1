@@ -54,7 +54,7 @@ class Bot2Params(BaseModel):
     """Parameters for Bot 2 — Hold to Resolution."""
     market_slug: str = Field(..., description="Polymarket market slug for BTC 5-min windows")
     amount_usd: float = Field(5.0, gt=0, description="Stake per trade in USD")
-    min_gap_pct: float = Field(0.10, ge=0.0, description="Minimum BTC gap % to enter")
+    min_gap_pct: float = Field(0.10, ge=0.0, description="Minimum BTC gap % to nearest $1000 level to enter")
     max_entry_price: float = Field(0.70, gt=0, le=1.0, description="Max price (odds) to pay")
     max_rounds: Optional[int] = Field(None, ge=1, description="Stop after N rounds (None = unlimited)")
 
