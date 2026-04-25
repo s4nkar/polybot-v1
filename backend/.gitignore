@@ -1,5 +1,6 @@
 # Virtual Environment
 /venv
+.venv
 
 # Model and Large File Directories
 /models/bert

@@ -25,22 +25,21 @@
 # Creates: trades table + global_config
 ```
 
-### 2. Backend
+### 2. Setup (First-time only)
 ```bash
-cd backend
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env: SUPABASE_URL, POLYMARKET_PRIVATE_KEY, etc.
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
-```
-✅ Test: `curl http://localhost:8000/health`
+# Sets up Python virtual environment, installs dependencies, and creates .env files
+./run.sh setup
 
-### 3. Frontend
-```bash
-cd frontend
-npm install
-npm run dev    # http://localhost:5173
+# Edit backend/.env: SUPABASE_URL, POLYMARKET_PRIVATE_KEY, etc.
 ```
+
+### 3. Run Services
+```bash
+# Starts both backend (FastAPI) and frontend (React) concurrently
+./run.sh run
+```
+✅ Test Backend: `curl http://localhost:8000/health`
+✅ Test Frontend: Open `http://localhost:5173`
 
 ### 4. Launch Bot
 - Settings → Add API keys

@@ -289,15 +289,20 @@ def _mask(value: str | None) -> str:
 async def get_config() -> ConfigResponse:
     """Return global config with sensitive keys masked."""
     row = db.get_config()
+    
+    def _val(key: str, default: Any) -> Any:
+        v = row.get(key)
+        return v if v is not None else default
+
     return ConfigResponse(
         polymarket_api_key=_mask(row.get("polymarket_api_key")),
         polymarket_wallet_address=_mask(row.get("polymarket_wallet_address")),
         telegram_bot_token=_mask(row.get("telegram_bot_token")),
-        telegram_chat_id=row.get("telegram_chat_id", ""),
-        telegram_enabled=row.get("telegram_enabled", True),
-        default_dry_run=row.get("default_dry_run", True),
-        default_amount_usd=float(row.get("default_amount_usd", 5.0)),
-        environment=row.get("environment", "dev"),
+        telegram_chat_id=_val("telegram_chat_id", ""),
+        telegram_enabled=_val("telegram_enabled", True),
+        default_dry_run=_val("default_dry_run", True),
+        default_amount_usd=float(_val("default_amount_usd", 5.0)),
+        environment=_val("environment", "dev"),
     )
 
 
